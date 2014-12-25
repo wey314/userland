@@ -56,6 +56,12 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <memory.h>
 #include <sysexits.h>
 
+#include <sys/socket.h>
+#include <ifaddrs.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+
 #define VERSION_STRING "v1.3.12"
 
 #include "bcm_host.h"
@@ -120,6 +126,7 @@ typedef struct RASPIVID_STATE_S RASPIVID_STATE;
 typedef struct
 {
    FILE *file_handle;                   /// File handle to write buffer data to.
+   int  socket_desc;                  /// Socket descriptor for network output
    RASPIVID_STATE *pstate;              /// pointer to our state in case required in callback
    int abort;                           /// Set to 1 in callback if an error occurs to attempt to abort the capture
    char *cb_buff;                       /// Circular buffer
@@ -149,6 +156,7 @@ struct RASPIVID_STATE_S
    int quantisationParameter;          /// Quantisation parameter - quality. Set bitrate 0 and set this for variable bitrate
    int bInlineHeaders;                  /// Insert inline headers to stream (SPS, PPS)
    char *filename;                     /// filename of output file
+   char *url;                          /// url of network output
    int verbose;                        /// !0 if want detailed run information
    int demoMode;                       /// Run app in demo mode
    int demoInterval;                   /// Interval between camera settings changes
@@ -240,6 +248,7 @@ static void display_valid_parameters(char *app_name);
 #define CommandCamSelect    24
 #define CommandSettings     25
 #define CommandSensorMode   26
+#define CommandOutputURL    27
 
 static COMMAND_LIST cmdline_commands[] =
 {
@@ -270,6 +279,7 @@ static COMMAND_LIST cmdline_commands[] =
    { CommandCamSelect,     "-camselect",  "cs", "Select camera <number>. Default 0", 1 },
    { CommandSettings,      "-settings",   "set","Retrieve camera settings and write to stdout", 0},
    { CommandSensorMode,    "-mode",       "md", "Force sensor mode. 0=auto. See docs for other modes available", 1},
+   { CommandOutputURL,     "-url",        "u",  "Output to url udp://ip:port or tcp://ip:port", 1 },   
 };
 
 static int cmdline_commands_size = sizeof(cmdline_commands) / sizeof(cmdline_commands[0]);
@@ -472,6 +482,24 @@ static int parse_cmdline(int argc, const char **argv, RASPIVID_STATE *state)
             valid = 0;
          break;
       }
+
+
+      case CommandOutputURL:  // output Url
+      {
+         int len = strlen(argv[i + 1]);
+         if (len)
+         {
+            state->url = malloc(len + 1);
+            vcos_assert(state->url);
+            if (state->url)
+               strncpy(state->url, argv[i + 1], len+1);
+            i++;
+         }
+         else
+            valid = 0;
+         break;
+      }
+
 
       case CommandVerbose: // display lots of data during run
          state->verbose = 1;
@@ -849,6 +877,102 @@ static FILE *open_filename(RASPIVID_STATE *pState)
 }
 
 /**
+ * Open a socket descriptor based on the url in state
+ * Supported schemes are udp and tcp
+ * 
+ * @param state Pointer to state
+ */
+static int open_url(RASPIVID_STATE *pState)
+{
+   char* ip = NULL;
+   int port = 0;
+
+   // Resolve socket type 
+   int sock_type = 0;
+   if (strncmp(pState->url, "udp://", 6) == 0)
+   {
+      sock_type = SOCK_DGRAM;
+      ip = pState->url + 6;
+   }
+   else if (strncmp(pState->url, "tcp://", 6) == 0)
+   {
+      sock_type = SOCK_STREAM;
+      ip = pState->url + 6;
+   }
+
+   // Resolve port
+   if (ip)
+   {
+      char* pport = strchr(ip, ':');
+      if (pport)
+      {
+         *pport = '\0';
+         port = atoi(pport + 1);
+      }
+   }
+
+   // Open socket descriptor
+   int sock_fd = 0;
+
+   if (ip && port)
+   {
+      struct hostent *he;
+      if ((he=gethostbyname(ip)) == NULL) {  // get the host info 
+         fprintf(stderr, "Failed to solve host \"%s\"\n", ip);
+         return 0;
+      }
+
+      if ((sock_fd = socket(AF_INET, sock_type, 0)) == -1) {
+         fprintf(stderr, "Failed to solve host \"%s\"\n", ip);
+         return 0;
+      }
+
+      struct sockaddr_in remote_addr;
+
+      remote_addr.sin_family = AF_INET;
+      remote_addr.sin_port = htons(port);
+      remote_addr.sin_addr = *((struct in_addr *)he->h_addr);
+      bzero(&(remote_addr.sin_zero), 8);
+
+      char addressBuffer[INET_ADDRSTRLEN];
+      inet_ntop(AF_INET, (void*)&remote_addr.sin_addr, addressBuffer, INET_ADDRSTRLEN);
+      if (pState->verbose)      
+         fprintf(stderr, "Network to %s\n", addressBuffer);
+
+      if (connect(sock_fd, (struct sockaddr *)&remote_addr, sizeof(struct sockaddr)) == -1) {
+         fprintf(stderr, "Failed to connect to url\n");
+         return 0;
+      }
+   }
+
+   if (pState->verbose)
+      fprintf(stderr, "open_url() - success\n");
+
+   // Return socket descriptor
+   return sock_fd;   
+}
+
+// Send a buffer over the network
+static void net_send(int socket_desc, uint8_t* buf, int len)
+{
+   if (socket_desc > 0)
+   {
+      int total = 0;       // how many bytes we've sent
+      int bytesleft = len; // how many we have left to send
+      int n;
+
+      while(total < len) {
+         n = send(socket_desc, buf+total, bytesleft, 0);
+         if (n == -1) { break; }
+         total += n;
+         bytesleft -= n;
+      }
+   }
+
+}
+
+
+/**
  * Open a file based on the settings in state
  *
  * This time for the imv output file
@@ -1050,6 +1174,13 @@ static void encoder_buffer_callback(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T *buf
             }
             else
             {
+               // First send over network
+               if (pData->socket_desc)
+               {
+                  net_send(pData->socket_desc, buffer->data, buffer->length);
+               }
+
+               // Write to file
                bytes_written = fwrite(buffer->data, 1, buffer->length, pData->file_handle);            
             }
 
@@ -1876,6 +2007,11 @@ int main(int argc, const char **argv)
                // Notify user, carry on but discarding encoded output buffers
                vcos_log_error("%s: Error opening output file: %s\nNo output file will be generated\n", __func__, state.filename);
             }
+         }
+
+         if (state.url)
+         {
+            state.callback_data.socket_desc = open_url(&state);
          }
 
          state.callback_data.imv_file_handle = NULL;
