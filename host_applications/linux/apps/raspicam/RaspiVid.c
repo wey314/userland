@@ -952,23 +952,27 @@ static int open_url(RASPIVID_STATE *pState)
    return sock_fd;   
 }
 
-// Send a buffer over the network
-static void net_send(int socket_desc, uint8_t* buf, int len)
+// Send a buffer over the network, returns total sent bytes or -1 for error
+static int net_send(int socket_desc, uint8_t* buf, int len)
 {
+   int total = 0;
    if (socket_desc > 0)
    {
-      int total = 0;       // how many bytes we've sent
-      int bytesleft = len; // how many we have left to send
+      int bytesleft = len;
       int n;
 
       while(total < len) {
          n = send(socket_desc, buf+total, bytesleft, 0);
-         if (n == -1) { break; }
+         if (n == -1)
+         {
+            total = -1;
+            break; 
+         }
          total += n;
          bytesleft -= n;
       }
    }
-
+   return total;
 }
 
 
@@ -1175,9 +1179,10 @@ static void encoder_buffer_callback(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T *buf
             else
             {
                // First send over network
-               if (pData->socket_desc)
+               if (pData->socket_desc > 0)
                {
-                  net_send(pData->socket_desc, buffer->data, buffer->length);
+                  if (net_send(pData->socket_desc, buffer->data, buffer->length) < 0)
+                     pData->socket_desc = 0;
                }
 
                // Write to file
@@ -2246,6 +2251,8 @@ error:
          fclose(state.callback_data.file_handle);
       if (state.callback_data.imv_file_handle && state.callback_data.imv_file_handle != stdout)
          fclose(state.callback_data.imv_file_handle);
+      if (state.callback_data.socket_desc > 0)
+         close(state.callback_data.socket_desc);
 
       /* Disable components */
       if (state.encoder_component)
