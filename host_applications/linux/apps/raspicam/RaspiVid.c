@@ -1042,7 +1042,7 @@ static void encoder_buffer_callback(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T *buf
       int bytes_written = buffer->length;
       int64_t current_time = vcos_getmicrosecs64()/1000;
 
-      vcos_assert(pData->file_handle);
+      //vcos_assert(pData->file_handle);
       if(pData->pstate->inlineMotionVectors) vcos_assert(pData->imv_file_handle);
 
       if (pData->cb_buff)
@@ -1185,13 +1185,16 @@ static void encoder_buffer_callback(MMAL_PORT_T *port, MMAL_BUFFER_HEADER_T *buf
                      pData->socket_desc = 0;
                }
 
-               // Write to file
-               bytes_written = fwrite(buffer->data, 1, buffer->length, pData->file_handle);            
+               // Then write to file
+               if (pData->file_handle != NULL)
+               {
+                  bytes_written = fwrite(buffer->data, 1, buffer->length, pData->file_handle);
+               }
             }
 
             mmal_buffer_header_mem_unlock(buffer);
 
-            if (bytes_written != buffer->length)
+            if (pData->file_handle != NULL && bytes_written != buffer->length)
             {
                vcos_log_error("Failed to write buffer data (%d from %d)- aborting", bytes_written, buffer->length);
                pData->abort = 1;
@@ -2122,7 +2125,7 @@ int main(int argc, const char **argv)
          {
             // Only encode stuff if we have a filename and it opened
             // Note we use the copy in the callback, as the call back MIGHT change the file handle
-            if (state.callback_data.file_handle)
+            if (state.callback_data.file_handle || state.callback_data.socket_desc)
             {
                int running = 1;
 
